@@ -1,0 +1,75 @@
+// Top-K k-NN kernel layout for a P×P rectangle of PEs.
+//
+// Color/task ID map. Slots 21..30 are left open for memcpy.
+//
+//   0  c2d_x_color_0        9  EXIT/state runtime
+//   1  c2d_x_color_1       10  c2d_x_entrypt_0
+//   4  c2d_y_color_0       11  c2d_x_entrypt_1
+//   5  c2d_y_color_1       12  c2d_y_entrypt_0
+//                           13  c2d_y_entrypt_1
+//                           14  state_task_id
+//
+// The grader provides these compile-time parameters through --params.
+param P:           u16; // PE grid is P×P.
+param d_dim:       u16; // Feature dimension for each database row.
+param rows_per_pe: u16; // Number of database rows assigned to each PE.
+param K:           u16; // Number of nearest neighbors returned globally.
+
+// Collective colors. These are intentionally outside the memcpy-reserved range.
+const c2d_x_color_0: color = @get_color(0);
+const c2d_x_color_1: color = @get_color(1);
+const c2d_y_color_0: color = @get_color(4);
+const c2d_y_color_1: color = @get_color(5);
+
+// Collective entrypoints and application state task.
+const c2d_x_entrypt_0: local_task_id = @get_local_task_id(10);
+const c2d_x_entrypt_1: local_task_id = @get_local_task_id(11);
+const c2d_y_entrypt_0: local_task_id = @get_local_task_id(12);
+const c2d_y_entrypt_1: local_task_id = @get_local_task_id(13);
+const state_task_id:   local_task_id = @get_local_task_id(14);
+
+const c2d = @import_module("<collectives_2d/params>");
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width  = P,
+  .height = P,
+});
+
+layout {
+  @set_rectangle(P, P);
+
+  var px: u16 = 0;
+  while (px < P) : (px += 1) {
+    var py: u16 = 0;
+
+    // memcpy routing depends only on the x-coordinate.
+    const memcpy_params = memcpy.get_params(px);
+
+    while (py < P) : (py += 1) {
+      const c2d_params = c2d.get_params(px, py, .{
+        .x_colors      = .{ c2d_x_color_0,   c2d_x_color_1 },
+        .x_entrypoints = .{ c2d_x_entrypt_0, c2d_x_entrypt_1 },
+        .y_colors      = .{ c2d_y_color_0,   c2d_y_color_1 },
+        .y_entrypoints = .{ c2d_y_entrypt_0, c2d_y_entrypt_1 },
+      });
+
+      @set_tile_code(px, py, "pe_program.csl", .{
+        .memcpy_params = memcpy_params,
+        .c2d_params    = c2d_params,
+        .P             = P,
+        .d_dim         = d_dim,
+        .rows_per_pe   = rows_per_pe,
+        .K             = K,
+        .state_task_id = state_task_id,
+      });
+    }
+  }
+
+  // Host-visible symbols.
+  @export_name("D",          [*]f32, true);
+  @export_name("q",          [*]f32, true);
+  @export_name("valid_rows", [*]u32, true);
+  @export_name("result_d",   [*]f32, true);
+  @export_name("result_i",   [*]u32, true);
+  @export_name("main",       fn()void);
+}

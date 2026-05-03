@@ -1,0 +1,15 @@
+# Cerebras SDK — downloaded and extracted into this directory before
+# `docker build`. Multi-GB binary blobs; never commit.
+sdk/
+Cerebras-SDK-*.tar.gz
+Cerebras-SDK-*/
+
+# Local Docker / shell helpers
+*.local
+*.local.sh
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+*.swp

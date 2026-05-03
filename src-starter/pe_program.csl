@@ -1,0 +1,322 @@
+param memcpy_params;
+param c2d_params;
+
+param P:           u16;
+param d_dim:       u16;
+param rows_per_pe: u16;
+param K:           u16;
+
+param state_task_id: local_task_id;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const mpi_x = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.x });
+const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.y });
+
+// === Local storage ===
+
+// Database shard stored column-major: D[col * rows_per_pe + row].
+var D: [rows_per_pe * d_dim]f32;
+var D_ptr: [*]f32 = &D;
+
+// Query vector. PE(0,0) receives it from the host, then broadcasts it.
+var q_buf: [d_dim]f32;
+var q_ptr: [*]f32 = &q_buf;
+
+// Number of real rows owned by this PE.
+// This handles uneven sharding when a PE has fewer than rows_per_pe valid rows.
+var valid_rows_arr: [1]u32;
+var valid_rows_ptr: [*]u32 = &valid_rows_arr;
+
+// Distance accumulator and temporary vector buffer.
+var local_dist: [rows_per_pe]f32;
+var diff_buf:   [rows_per_pe]f32;
+
+// Bounded max-heap storing the local or merged top-K candidates.
+// The root is the current worst candidate among the kept K values.
+var heap_dist: [K]f32;
+var heap_idx:  [K]u32;
+var heap_size: u16 = 0;
+
+// Interleaved gather payload: bitcast(distance), index.
+var packed_topk: [2 * K]u32;
+
+// Shared receive buffer used for both row and column gathers.
+var recv_buf: [2 * K * P]u32;
+
+// Final output buffers. Only PE(0,0) writes the final sorted answer.
+var result_d: [K]f32;
+var result_i: [K]u32;
+var result_d_ptr: [*]f32 = &result_d;
+var result_i_ptr: [*]u32 = &result_i;
+
+// PE coordinates and state-machine bookkeeping.
+var px: u16 = 0;
+var py: u16 = 0;
+var pe_global_id: u32 = 0;
+var start_idx:    u32 = 0;
+var state:        u16 = 0;
+
+// DSD views used for vectorized distance computation.
+const D_dsd    = @get_dsd(mem1d_dsd, .{ .base_address = &D,          .extent = rows_per_pe });
+const dist_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_dist, .extent = rows_per_pe });
+const diff_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &diff_buf,   .extent = rows_per_pe });
+
+// === Heap utilities ===
+
+// Returns true when candidate a is worse than candidate b.
+// Larger distance is worse; equal distances are broken by larger global index.
+fn lex_gt(da: f32, ia: u32, db: f32, ib: u32) bool {
+  if (da > db) return true;
+  if (da < db) return false;
+  return ia > ib;
+}
+
+fn heap_swap(a: u16, b: u16) void {
+  const td = heap_dist[a]; heap_dist[a] = heap_dist[b]; heap_dist[b] = td;
+  const ti = heap_idx[a];  heap_idx[a]  = heap_idx[b];  heap_idx[b]  = ti;
+}
+
+fn heap_sift_up(start_in: u16) void {
+  var i: u16 = start_in;
+  while (i > 0) {
+    const parent: u16 = (i - 1) / 2;
+    if (lex_gt(heap_dist[i], heap_idx[i], heap_dist[parent], heap_idx[parent])) {
+      heap_swap(i, parent);
+      i = parent;
+    } else {
+      return;
+    }
+  }
+}
+
+fn heap_sift_down(start_in: u16) void {
+  var i: u16 = start_in;
+  while (true) {
+    const left:  u16 = 2 * i + 1;
+    const right: u16 = 2 * i + 2;
+    var largest: u16 = i;
+
+    if (left < heap_size and lex_gt(heap_dist[left], heap_idx[left],
+                                    heap_dist[largest], heap_idx[largest])) {
+      largest = left;
+    }
+
+    if (right < heap_size and lex_gt(heap_dist[right], heap_idx[right],
+                                     heap_dist[largest], heap_idx[largest])) {
+      largest = right;
+    }
+
+    if (largest == i) return;
+
+    heap_swap(i, largest);
+    i = largest;
+  }
+}
+
+fn heap_push(d: f32, idx: u32) void {
+  if (heap_size < K) {
+    heap_dist[heap_size] = d;
+    heap_idx[heap_size]  = idx;
+    heap_size += 1;
+    heap_sift_up(heap_size - 1);
+  } else {
+    // Replace the current worst candidate only if the new candidate is better.
+    if (lex_gt(heap_dist[0], heap_idx[0], d, idx)) {
+      heap_dist[0] = d;
+      heap_idx[0]  = idx;
+      heap_sift_down(0);
+    }
+  }
+}
+
+// Fill unused heap slots with candidates that can never beat real finite rows.
+fn heap_pad_to_K() void {
+  while (heap_size < K) {
+    heap_dist[heap_size] = @bitcast(f32, @as(u32, 0x7F800000));
+    heap_idx[heap_size]  = 0xFFFFFFFF;
+    heap_size += 1;
+    heap_sift_up(heap_size - 1);
+  }
+}
+
+// === Local distance computation ===
+
+fn compute_distances() void {
+  // Accumulate squared L2 distance for each local row.
+  // D is column-major, so each dimension is a contiguous vector over rows.
+  for (@range(u16, d_dim)) |j| {
+    const off: i16 = @as(i16, j) * @as(i16, rows_per_pe);
+    const D_col_dsd = @increment_dsd_offset(D_dsd, off, f32);
+
+    @fsubs(diff_dsd, D_col_dsd, q_buf[j]);
+    @fmuls(diff_dsd, diff_dsd, diff_dsd);
+    @fadds(dist_dsd, dist_dsd, diff_dsd);
+  }
+
+  // Insert only real rows. Invalid padded rows are represented later by sentinels.
+  heap_size = 0;
+  const vr: u32 = valid_rows_arr[0];
+
+  var i: u32 = 0;
+  while (i < vr) : (i += 1) {
+    heap_push(local_dist[i], start_idx + i);
+  }
+
+  heap_pad_to_K();
+
+  // Prepare local top-K candidates for row gather.
+  var k: u16 = 0;
+  while (k < K) : (k += 1) {
+    packed_topk[2 * k]     = @bitcast(u32, heap_dist[k]);
+    packed_topk[2 * k + 1] = heap_idx[k];
+  }
+}
+
+// Merge P chunks of K candidates from recv_buf into this PE's heap.
+fn merge_recv_into_heap() void {
+  heap_size = 0;
+
+  const total_pairs: u16 = K * P;
+  var p: u16 = 0;
+
+  while (p < total_pairs) : (p += 1) {
+    const d   = @bitcast(f32, recv_buf[2 * p]);
+    const idx = recv_buf[2 * p + 1];
+    heap_push(d, idx);
+  }
+
+  heap_pad_to_K();
+}
+
+fn pack_heap() void {
+  var k: u16 = 0;
+  while (k < K) : (k += 1) {
+    packed_topk[2 * k]     = @bitcast(u32, heap_dist[k]);
+    packed_topk[2 * k + 1] = heap_idx[k];
+  }
+}
+
+// Convert the max-heap into ascending sorted output.
+fn heap_sort_into_result() void {
+  var sz: u16 = K;
+
+  while (sz > 0) : (sz -= 1) {
+    const last: u16 = sz - 1;
+
+    result_d[last] = heap_dist[0];
+    result_i[last] = heap_idx[0];
+
+    heap_size -= 1;
+
+    if (heap_size > 0) {
+      heap_dist[0] = heap_dist[heap_size];
+      heap_idx[0]  = heap_idx[heap_size];
+      heap_sift_down(0);
+    }
+  }
+}
+
+// === State machine ===
+//
+// 0: Broadcast q east across row 0.
+// 1: Broadcast q south down each column.
+// 2: Compute local distances and local top-K.
+// 3: Gather local top-K candidates across each row into px = 0.
+// 4: Merge row candidates on column-0 PEs.
+// 5: Gather the row winners down column 0 into PE(0,0).
+// 6: Merge global candidates and sort final result on PE(0,0).
+// 7+: Release the host command stream.
+
+task state_task() void {
+  switch (state) {
+    0 => {
+      state = 1;
+
+      if (py == 0) {
+        mpi_x.broadcast(0, @ptrcast([*]u32, &q_buf), d_dim, state_task_id);
+      } else {
+        @activate(state_task_id);
+      }
+    },
+
+    1 => {
+      state = 2;
+      mpi_y.broadcast(0, @ptrcast([*]u32, &q_buf), d_dim, state_task_id);
+    },
+
+    2 => {
+      state = 3;
+      compute_distances();
+      @activate(state_task_id);
+    },
+
+    3 => {
+      state = 4;
+      mpi_x.gather(0, @ptrcast([*]u32, &packed_topk),
+                      @ptrcast([*]u32, &recv_buf),
+                      2 * K, state_task_id);
+    },
+
+    4 => {
+      state = 5;
+
+      if (px == 0) {
+        merge_recv_into_heap();
+        pack_heap();
+      }
+
+      @activate(state_task_id);
+    },
+
+    5 => {
+      state = 6;
+
+      if (px == 0) {
+        mpi_y.gather(0, @ptrcast([*]u32, &packed_topk),
+                        @ptrcast([*]u32, &recv_buf),
+                        2 * K, state_task_id);
+      } else {
+        @activate(state_task_id);
+      }
+    },
+
+    6 => {
+      state = 7;
+
+      if (px == 0 and py == 0) {
+        merge_recv_into_heap();
+        heap_sort_into_result();
+      }
+
+      @activate(state_task_id);
+    },
+
+    else => {
+      sys_mod.unblock_cmd_stream();
+    },
+  }
+}
+
+fn main() void {
+  mpi_x.init();
+  mpi_y.init();
+
+  px = mpi_x.pe_id;
+  py = mpi_y.pe_id;
+
+  pe_global_id = @as(u32, py) * @as(u32, P) + @as(u32, px);
+  start_idx    = pe_global_id * @as(u32, rows_per_pe);
+
+  @activate(state_task_id);
+}
+
+comptime {
+  @bind_local_task(state_task, state_task_id);
+
+  @export_symbol(D_ptr,          "D");
+  @export_symbol(q_ptr,          "q");
+  @export_symbol(valid_rows_ptr, "valid_rows");
+  @export_symbol(result_d_ptr,   "result_d");
+  @export_symbol(result_i_ptr,   "result_i");
+  @export_symbol(main);
+}
