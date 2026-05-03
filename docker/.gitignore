@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Cerebras SDK — downloaded and extracted into this directory before
 # `docker build`. Multi-GB binary blobs; never commit.
 sdk/
@@ -13,3 +14,8 @@ Cerebras-SDK-*/
 # OS / editor cruft
 .DS_Store
 *.swp
+=======
+# Candidate-provided SDK, do not commit
+sdk/
+Cerebras-SDK-*.tar.gz
+>>>>>>> b2e48fe8c7977ffe052ad94f35b8722255977279

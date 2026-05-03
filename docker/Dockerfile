@@ -9,6 +9,7 @@ FROM --platform=linux/amd64 ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+<<<<<<< HEAD
       ca-certificates curl gnupg \
       python3 python3-pip tzdata \
       fuse2fs fuse-overlayfs squashfs-tools \
@@ -17,6 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         -o /tmp/apptainer.deb \
     && apt-get install -y /tmp/apptainer.deb \
     && rm -f /tmp/apptainer.deb \
+=======
+      software-properties-common ca-certificates curl gnupg \
+      python3 python3-pip tzdata \
+    && add-apt-repository -y ppa:apptainer/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends apptainer \
+>>>>>>> b2e48fe8c7977ffe052ad94f35b8722255977279
     && rm -rf /var/lib/apt/lists/*
 
 # Apptainer bind-mounts /etc/localtime from the Docker container into the SIF
